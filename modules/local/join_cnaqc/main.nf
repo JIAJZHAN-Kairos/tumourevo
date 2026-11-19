@@ -38,6 +38,17 @@ process JOIN_CNAQC {
             })
     names(result) = samples
 
+    # BRCA/SASH guard: CNAqc::multisample_init requires a peak analysis in every
+    # object. Samples where CNAqc could not run one even after the CNAQC fallback
+    # are skipped with a recorded reason (exit 3, ignored by pipeline config).
+    no_peaks = if (as.logical("$qc_chr")) character(0) else names(result)[vapply(result, function(o) is.null(o\$peaks_analysis), logical(1))]
+    if (length(no_peaks) > 0) {
+        msg = paste0("JOIN_CNAQC skipped for $meta.id: no CNAqc peak analysis for ", paste(no_peaks, collapse = ", "))
+        message(msg)
+        writeLines(msg, paste0("$prefix", "_join_skipped.txt"))
+        quit(save = "no", status = 3)
+    }
+
 
     if (as.logical("$qc_chr") == TRUE) {
         result = lapply(result, function(x) {

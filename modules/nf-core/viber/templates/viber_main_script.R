@@ -37,6 +37,17 @@ library(ggplot2)
 library(CNAqc)
 library(ggpubr)
 
+# BRCA/SASH guard: subset_by_segment_karyotype() errors when a sample has no
+# 1:1 segments (common after WGD). Return an empty mutation table instead so the
+# downstream guard can skip the sample with a recorded reason.
+diploid_mutations = function(obj) {
+  tryCatch(obj %>% CNAqc::subset_by_segment_karyotype("1:1") %>% CNAqc::Mutations(),
+           error = function(e) {
+             cli::cli_alert_warning(paste0("No 1:1 segments: ", conditionMessage(e)))
+             CNAqc::Mutations(obj)[0, ]
+           })
+}
+
 samples = substr("$tumour_samples", 2, nchar("$tumour_samples")-1)
 samples = strsplit(samples, ", ")[[1]]
 
@@ -68,9 +79,7 @@ if ( grepl(".rds\$", tolower("$rds_join")) ) {
       shared = input_obj %>% get_sample(sample=samples, which_obj="shared")
       joint_table = lapply(names(shared),
                            function(sample_name) {
-                             table_s = shared[[sample_name]] %>%
-                               CNAqc::subset_by_segment_karyotype("1:1") %>%
-                               CNAqc::Mutations() %>%
+                             table_s = diploid_mutations(shared[[sample_name]]) %>%
                                dplyr::mutate(sample_id=sample_name) %>%
                                dplyr::filter(chr %in% c(paste0('chr', 1:22), as.character(1:22))) %>%
                                dplyr::filter(blacklisted==FALSE)
@@ -93,9 +102,16 @@ if ( grepl(".rds\$", tolower("$rds_join")) ) {
     dplyr::filter(blacklisted==FALSE)
 }
 
-if (nrow(joint_table) == 0) {
-  cli::cli_alert_warning("No samples contain diploid mutations!")
+# BRCA/SASH guard: VIBER fits diploid (1:1) mutations only; skip samples that
+# cannot be fitted with a recorded reason (exit 3, ignored by pipeline config).
+skip_viber = function(reason) {
+  msg = paste0("VIBER skipped for $meta.patient: ", reason)
+  cli::cli_alert_warning(msg)
+  writeLines(msg, paste0(opt[["prefix"]], "_viber_skipped.txt"))
+  quit(save = "no", status = 3)
 }
+if (nrow(joint_table) < as.integer(opt[["K"]]))
+  skip_viber(paste0(nrow(joint_table), " diploid (1:1) mutations, fewer than K=", opt[["K"]]))
 
 cli::cli_text("Joint table created.")
 
@@ -125,9 +141,11 @@ nv = reads_data %>%
 viber_K = as.integer(opt[["K"]])
 
 cli::cli_text("Starting standard fit")
-st_fit = VIBER::variational_fit(nv, dp,
+st_fit = tryCatch(VIBER::variational_fit(nv, dp,
                                 K=viber_K,
-                                data=reads_data)
+                                data=reads_data),
+                  error = function(e) skip_viber(paste0("fit failed with ", nrow(joint_table),
+                                                        " diploid mutations: ", conditionMessage(e))))
 st_fit[["description"]]="$meta.patient"
 cli::cli_text("End standard fit")
 best_fit = best_fit_heuristic = st_fit

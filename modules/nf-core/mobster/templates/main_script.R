@@ -33,6 +33,17 @@ library(dplyr)
 library(cli)
 library(ggplot2)
 
+# BRCA/SASH guard: subset_by_segment_karyotype() errors when a sample has no
+# 1:1 segments (common after WGD). Return an empty mutation table instead so the
+# downstream guard can skip the sample with a recorded reason.
+diploid_mutations = function(obj) {
+  tryCatch(obj %>% CNAqc::subset_by_segment_karyotype("1:1") %>% CNAqc::Mutations(),
+           error = function(e) {
+             cli::cli_alert_warning(paste0("No 1:1 segments: ", conditionMessage(e)))
+             CNAqc::Mutations(obj)[0, ]
+           })
+}
+
 description = "$meta.patient"
 samples = strsplit(x="$meta.tumour_sample", ",") %>% unlist()  # list of samples
 
@@ -64,10 +75,7 @@ if ( grepl(".rds\$", tolower("$rds_join")) ) {
       input_table = lapply(names(original),
                            function(sample_name) {
                              purity = original[[sample_name]][["purity"]]
-                             table_s = original[[sample_name]] %>%
-                               # keep only mutations on the diploid karyotype
-                               CNAqc::subset_by_segment_karyotype("1:1") %>%
-                               CNAqc::Mutations() %>%
+                             table_s = diploid_mutations(original[[sample_name]]) %>%
                                dplyr::mutate(sample_id=sample_name, purity=purity) %>%
                                dplyr::filter(blacklisted==FALSE)
                              if (nrow(table_s) == 0) {
@@ -112,8 +120,24 @@ run_mobster_fit = function(joint_table, descr) {
 ## Run MOBSTER on each sample
 lapply(samples, function(sample_name) {
 
-    fit = run_mobster_fit(joint_table=input_table %>% dplyr::filter(sample_id == !!sample_name),
-                          descr=paste(description, sample_name, sep=":"))
+    sample_table = input_table %>% dplyr::filter(sample_id == !!sample_name)
+    # BRCA/SASH guard: MOBSTER fits diploid (1:1) mutations only. Polyploid or
+    # very low-purity samples can have too few; skip with a recorded reason
+    # (exit 3, ignored by the pipeline config) instead of crashing the run.
+    skip_mobster = function(reason) {
+        msg = paste0("MOBSTER skipped for ", sample_name, ": ", reason)
+        cli::cli_alert_warning(msg)
+        writeLines(msg, paste0(opt[["prefix"]], "_mobster_skipped.txt"))
+        quit(save = "no", status = 3)
+    }
+    n_diploid = sum(sample_table[["VAF"]] < 1 & sample_table[["VAF"]] >= as.numeric(opt[["min_VAF"]]) &
+                    sample_table[["karyotype"]] == "1:1", na.rm = TRUE)
+    if (n_diploid < as.integer(opt[["n_cutoff"]]))
+        skip_mobster(paste0(n_diploid, " diploid (1:1) mutations, fewer than n_cutoff=", opt[["n_cutoff"]]))
+    fit = tryCatch(run_mobster_fit(joint_table=sample_table,
+                                   descr=paste(description, sample_name, sep=":")),
+                   error = function(e) skip_mobster(paste0("fit failed with ", n_diploid,
+                                                           " diploid mutations: ", conditionMessage(e))))
 
     if (fit[["best"]][["fit.tail"]]) {
         evoparams = evolutionary_parameters(fit)

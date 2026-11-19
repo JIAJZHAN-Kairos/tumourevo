@@ -91,6 +91,17 @@ library(dplyr)
 library(CNAqc)
 library(gridExtra)
 
+# BRCA/SASH guard: CNAqc skips peak QC when no simple karyotype reaches
+# min_absolute_karyotype_mutations; its QC plots then fail on a NULL table.
+# Keep the analysis and save an annotated empty panel instead of aborting.
+safe_plot = function(expr, what) {
+  tryCatch(expr, error = function(e) {
+    cli::cli_alert_warning(paste0(what, " not available: ", conditionMessage(e)))
+    ggplot2::ggplot() + ggplot2::theme_void() +
+      ggplot2::labs(title = paste0(what, ": not available"), subtitle = conditionMessage(e))
+  })
+}
+
 SNV = readRDS("$snv_rds") %>%
   purrr::pluck("$tumour_sample", "mutations") %>%
   dplyr::mutate(mutation_id = paste(chr,from,to,ref,alt,sep = ':'))
@@ -110,6 +121,36 @@ x = CNAqc::analyze_peaks(x,
                           min_absolute_karyotype_mutations = as.numeric(opt[["min_absolute_karyotype_mutations"]]),
                           purity_error = as.numeric(opt[["purity_error"]]),
                           min_VAF = opt[['min_VAF']])
+
+# BRCA/SASH guard: multisample_init (JOIN_CNAQC) requires a peak analysis for
+# every sample. Polyploid or very low-purity samples can have no simple
+# karyotype reaching min_absolute_karyotype_mutations, so CNAqc skips it. Retry
+# once at the largest simple-karyotype count (floor 10) and record the fallback;
+# segments, mutations and CCF are unaffected (QC_filter is FALSE downstream).
+peaks_missing = function(obj) is.null(obj\$peaks_analysis) || is.null(obj\$peaks_analysis\$matches)
+if (peaks_missing(x)) {
+  simple_counts = CNAqc::Mutations(x) %>%
+    dplyr::filter(karyotype %in% c("1:0", "1:1", "2:0", "2:1", "2:2")) %>%
+    dplyr::count(karyotype) %>% dplyr::pull(n)
+  fallback_n = max(c(simple_counts, 0))
+  note = paste0("Peak analysis skipped at min_absolute_karyotype_mutations=",
+                opt[["min_absolute_karyotype_mutations"]], "; largest simple karyotype has ",
+                fallback_n, " mutations.")
+  if (fallback_n >= 10) {
+    x = CNAqc::analyze_peaks(x,
+                              matching_strategy = opt[["matching_strategy"]],
+                              min_absolute_karyotype_mutations = fallback_n,
+                              purity_error = as.numeric(opt[["purity_error"]]),
+                              min_VAF = opt[['min_VAF']])
+    note = paste0(note, " Re-ran with min_absolute_karyotype_mutations=", fallback_n,
+                  if (peaks_missing(x)) " (still no peak analysis)." else ".")
+  } else {
+    note = paste0(note, " Below floor of 10; no fallback.")
+  }
+  cli::cli_alert_warning(note)
+  x\$tumourevo_peak_fallback = note
+  writeLines(note, paste0(opt[["prefix"]], "_peak_fallback.txt"))
+}
 
 x = CNAqc::compute_CCF(x,
                         muts_per_karyotype = as.numeric(opt[["muts_per_karyotype"]]),
@@ -143,9 +184,9 @@ pl_exp = ggpubr::annotate_figure(pl_exp, top = ggpubr::text_grob("$tumour_sample
 
 pl_qc = ggpubr::ggarrange(
   plotlist = list(
-    CNAqc::plot_peaks_analysis(tmp_x, what = 'common', empty_plot = FALSE),
-    CNAqc::plot_qc(tmp_x),
-    CNAqc::plot_CCF(tmp_x, assembly_plot = TRUE, empty_plot = FALSE)),
+    safe_plot(CNAqc::plot_peaks_analysis(tmp_x, what = 'common', empty_plot = FALSE), "Peaks analysis"),
+    safe_plot(CNAqc::plot_qc(tmp_x), "QC summary"),
+    safe_plot(CNAqc::plot_CCF(tmp_x, assembly_plot = TRUE, empty_plot = FALSE), "CCF")),
   nrow = 3,
   heights = c(1,1.5,1))
 pl_qc = ggpubr::annotate_figure(pl_qc, top = ggpubr::text_grob("$tumour_sample", size = 14))
@@ -192,16 +233,16 @@ if(opt[["qc_chr"]] == TRUE) {
   pa_plt = lapply(tmp_x, function(cc) {
 
     qc = tryCatch({
-      CNAqc::plot_qc(cc)
+      safe_plot(CNAqc::plot_qc(cc), "QC summary")
     }, error = function(e) {
       CNAqc:::eplot()
     })
 
     pl_qc = ggpubr::ggarrange(
       plotlist = list(
-        CNAqc::plot_peaks_analysis(cc, what = 'common', empty_plot = FALSE),
+        safe_plot(CNAqc::plot_peaks_analysis(cc, what = 'common', empty_plot = FALSE), "Peaks analysis"),
         qc,
-        CNAqc::plot_CCF(cc, assembly_plot = TRUE, empty_plot = FALSE)),
+        safe_plot(CNAqc::plot_CCF(cc, assembly_plot = TRUE, empty_plot = FALSE), "CCF")),
       nrow = 3,
       heights = c(1,1.5,1))
     pl_qc = ggpubr::annotate_figure(pl_qc, top = ggpubr::text_grob(cc\$sample, size = 14))
