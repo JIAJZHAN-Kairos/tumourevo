@@ -46,7 +46,9 @@ workflow SIGNATURE_DECONVOLUTION {
 
     if (params.tools && params.tools.split(',').contains('sigprofiler')) {
         if (params.download_sigprofiler_genome) {
-            genome_path = channel.fromPath('opt/null')
+            // Placeholder: the genome is installed inside the task, but the process
+            // input must still be a stageable file ('opt/null' does not exist).
+            genome_path = file("${projectDir}/assets/NO_FILE", checkIfExists: true)
         } else {
             genome_path = params.genome_installed_path
         }
