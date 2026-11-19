@@ -126,8 +126,50 @@ if __name__ == "__main__":
     # Conditionally install genome or use provided path
     if opt.get("download_genome_sigprofiler", True):
         print(f"Installing genome {genome} via SigProfilerMatrixGenerator...", flush=True)
-        install_genome = f"SigProfilerMatrixGenerator install {genome} -v {opt['volume']}"
-        subprocess.run(install_genome, shell=True, check=True)
+        # SigProfilerMatrixGenerator 1.4.0 (2026-10) replaced <genome>.tar.gz on the
+        # Alexandrov lab FTP with a corrected transcription-strand build. Releases
+        # before 1.4.0 (this container) carry the old checksums and reject it as
+        # "not installed". The original bytes are published as <genome>_Legacy.tar.gz
+        # (top-level folder <genome>_Legacy/), which matches this version's checksums
+        # and bundled context tables; the DNA sequence is the same. Extract it under
+        # the plain genome name and verify with the package's own check.
+        spmg_major_minor = tuple(int(v) for v in version("SigProfilerMatrixGenerator").split(".")[:2])
+        if spmg_major_minor < (1, 4) and genome in {"GRCh37", "GRCh38", "mm9", "mm10", "mm39"}:
+            import tarfile
+            import urllib.request
+            from SigProfilerMatrixGenerator.scripts import ref_install, reference_genome_manager
+
+            archive = os.path.abspath(f"{genome}_Legacy.tar.gz")
+            for server in ("alexandrovlab-ftp.ucsd.edu/pub/tools/SigProfilerMatrixGenerator",
+                           "ngs.sanger.ac.uk/scratch/project/mutographs/SigProf"):
+                url = f"ftp://{server}/{genome}_Legacy.tar.gz"
+                try:
+                    print(f"Downloading {url}", flush=True)
+                    urllib.request.urlretrieve(url, archive)
+                    break
+                except Exception as err:
+                    print(f"Download from {server} failed: {err}", flush=True)
+            else:
+                raise RuntimeError(f"Could not download {genome}_Legacy.tar.gz")
+            tsb_dir = ref_install.reference_dir(secondary_chromosome_install_dir=opt["volume"]).get_tsb_dir()
+            os.makedirs(tsb_dir / genome, exist_ok=True)
+            with tarfile.open(archive, "r:gz") as tar:
+                for member in tar.getmembers():
+                    top, _, rest = member.name.partition("/")
+                    if not member.isfile() or top != f"{genome}_Legacy" or "/" in rest or rest.startswith("."):
+                        continue
+                    src = tar.extractfile(member)
+                    with open(tsb_dir / genome / rest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+            os.remove(archive)
+            manager = reference_genome_manager.ReferenceGenomeManager(opt["volume"])
+            if not manager.is_genome_installed(genome):
+                manager.print_genome_checksum_verification_report(genome)
+                raise RuntimeError(f"{genome}_Legacy did not pass the checksum check")
+            print(f"Installed {genome} from {genome}_Legacy.tar.gz (checksums verified)", flush=True)
+        else:
+            install_genome = f"SigProfilerMatrixGenerator install {genome} -v {opt['volume']}"
+            subprocess.run(install_genome, shell=True, check=True)
     else:
         if not opt.get("genome_installed_path"):
             raise ValueError("download_genome_sigprofiler is False but no genome_installed_path was provided.")
