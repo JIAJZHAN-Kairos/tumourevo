@@ -116,6 +116,8 @@ x = CNAqc::init(
   sample = "$tumour_sample",
   blacklist_indels = opt[['blacklist_indels']])
 
+x_init = x  # pre-analysis object, used by the peak-analysis fallback below
+
 x = CNAqc::analyze_peaks(x,
                           matching_strategy = opt[["matching_strategy"]],
                           min_absolute_karyotype_mutations = as.numeric(opt[["min_absolute_karyotype_mutations"]]),
@@ -125,7 +127,7 @@ x = CNAqc::analyze_peaks(x,
 # BRCA/SASH guard: multisample_init (JOIN_CNAQC) requires a peak analysis for
 # every sample. Polyploid or very low-purity samples can have no simple
 # karyotype reaching min_absolute_karyotype_mutations, so CNAqc skips it. Retry
-# once at the largest simple-karyotype count (floor 10) and record the fallback;
+# once at min_absolute_karyotype_mutations=10 and record the fallback;
 # segments, mutations and CCF are unaffected (QC_filter is FALSE downstream).
 peaks_missing = function(obj) is.null(obj\$peaks_analysis) || is.null(obj\$peaks_analysis\$matches)
 if (peaks_missing(x)) {
@@ -135,15 +137,21 @@ if (peaks_missing(x)) {
   fallback_n = max(c(simple_counts, 0))
   note = paste0("Peak analysis skipped at min_absolute_karyotype_mutations=",
                 opt[["min_absolute_karyotype_mutations"]], "; largest simple karyotype has ",
-                fallback_n, " mutations.")
+                fallback_n, " mutations (before indel filtering).")
   if (fallback_n >= 10) {
-    x = CNAqc::analyze_peaks(x,
+    # Re-run on the pre-analysis object (re-analysing x fails in CNAqc 1.1.4).
+    x_fb = tryCatch(CNAqc::analyze_peaks(x_init,
                               matching_strategy = opt[["matching_strategy"]],
-                              min_absolute_karyotype_mutations = fallback_n,
+                              min_absolute_karyotype_mutations = 10,
                               purity_error = as.numeric(opt[["purity_error"]]),
-                              min_VAF = opt[['min_VAF']])
-    note = paste0(note, " Re-ran with min_absolute_karyotype_mutations=", fallback_n,
-                  if (peaks_missing(x)) " (still no peak analysis)." else ".")
+                              min_VAF = opt[['min_VAF']]),
+                    error = function(e) { cli::cli_alert_warning(conditionMessage(e)); NULL })
+    if (!is.null(x_fb) && !peaks_missing(x_fb)) {
+      x = x_fb
+      note = paste0(note, " Re-ran with min_absolute_karyotype_mutations=10.")
+    } else {
+      note = paste0(note, " Re-run with min_absolute_karyotype_mutations=10 gave no peak analysis.")
+    }
   } else {
     note = paste0(note, " Below floor of 10; no fallback.")
   }
